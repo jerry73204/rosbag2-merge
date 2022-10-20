@@ -1,12 +1,16 @@
 use anyhow::{ensure, Result};
+use async_std::task::spawn;
 use clap::Parser;
-use futures::stream::{self, StreamExt, TryChunksError, TryStreamExt};
+use futures::{
+    future,
+    stream::{self, StreamExt, TryStreamExt},
+};
 use itertools::Itertools;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    ConnectOptions, FromRow, Pool, QueryBuilder,
+    ConnectOptions, FromRow, QueryBuilder,
 };
-use std::{collections::HashMap, str::FromStr, thread};
+use std::{collections::HashMap, str::FromStr, sync::Arc, thread, time::Instant};
 
 /// Rosbag2 merging tool.
 #[derive(Parser)]
@@ -36,7 +40,7 @@ struct Message {
     pub data: Vec<u8>,
 }
 
-#[tokio::main]
+#[async_std::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
@@ -44,7 +48,7 @@ async fn main() -> Result<()> {
 
     /* These mnemonics are used. */
     // f: file
-    // p: pool
+    // c: database connection
     // t: topic
     // tv: topic vec
     // ti: topic id
@@ -52,10 +56,11 @@ async fn main() -> Result<()> {
     // x_to_y: a map from x to y
 
     // Open input sqlite databases
-    let f_to_p: HashMap<String, Pool<_>> = stream::iter(opts.input_bags)
+    let f_to_c: HashMap<&String, _> = stream::iter(&opts.input_bags)
         .map(|path| async move {
             let uri = format!("sqlite://{}", path);
             let pool = SqlitePoolOptions::new().connect(&uri).await?;
+            // let pool = SqliteConnectOptions::new().filename(path).connect().await?;
             anyhow::Ok((path, pool))
         })
         .buffer_unordered(n_workers)
@@ -63,12 +68,12 @@ async fn main() -> Result<()> {
         .await?;
 
     // Read topics from input databases
-    let f_to_tv: HashMap<&String, Vec<Topic>> = stream::iter(&f_to_p)
+    let f_to_tv: HashMap<&String, Vec<Topic>> = stream::iter(&f_to_c)
         .map(|(path, pool)| async move {
             let topics: Vec<Topic> = sqlx::query_as("SELECT * FROM topics")
                 .fetch_all(pool)
                 .await?;
-            anyhow::Ok((path, topics))
+            anyhow::Ok((*path, topics))
         })
         .buffer_unordered(n_workers)
         .try_collect()
@@ -147,14 +152,76 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    // let f_ti_to_new_ti: HashMap<(String, u32), u32> = f_ti_to_t
-    //     .iter()
-    //     .map(|((path, orig_topic_id), topic)| {
-    //         let topic_name = &topic.name;
-    //         let remap_topic_id = tn_to_t[topic_name].id;
-    //         ((path.to_string(), *orig_topic_id), remap_topic_id)
-    //     })
-    //     .collect();
+    let f_to_ti_to_new_ti: HashMap<String, HashMap<u32, u32>> = f_ti_to_t
+        .iter()
+        .map(|((path, orig_topic_id), topic)| {
+            let topic_name = &topic.name;
+            let remap_topic_id = tn_to_t[topic_name].id;
+            (path.to_string(), (*orig_topic_id, remap_topic_id))
+        })
+        .into_grouping_map()
+        .collect();
+
+    // Gather messages from all input databases
+    let f_to_ti_to_new_ti = Arc::new(f_to_ti_to_new_ti);
+
+    // Load messages from input files and re-index topic IDs
+    let (loading_futures, msg_stream_vec): (Vec<_>, Vec<_>) = f_to_c
+        .into_iter()
+        .map(|(path, pool)| {
+            let f_to_ti_to_new_ti = f_to_ti_to_new_ti.clone();
+            let (tx, rx) = flume::bounded(8);
+            let path = path.clone();
+
+            let future = spawn(async move {
+                let stream = sqlx::query_as::<_, Message>("SELECT * FROM messages").fetch(&pool);
+
+                let mut stream = stream.map_ok(move |msg| {
+                    // let key = (*path, msg.topic_id);
+                    let remap_topic_id = f_to_ti_to_new_ti[&path][&msg.topic_id];
+                    Message {
+                        topic_id: remap_topic_id,
+                        ..msg
+                    }
+                });
+
+                while let Some(msg) = stream.try_next().await? {
+                    let ok = tx.send_async(msg).await.is_ok();
+                    if !ok {
+                        break;
+                    }
+                }
+
+                anyhow::Ok(())
+            });
+
+            (future, rx.into_stream())
+        })
+        .unzip();
+
+    // Join message streams where messages are ordered by timestamps
+    let message_stream =
+        join_ordered_streams::join_ordered_streams(|msg| msg.timestamp, msg_stream_vec);
+
+    // Re-index message IDs
+    let message_stream = message_stream.enumerate().map(|(msg_id, msg)| Message {
+        id: msg_id as u32,
+        ..msg
+    });
+
+    // Print message rate
+    let message_stream = message_stream.scan((Instant::now(), 0), |(instant, count), msg| {
+        let secs = instant.elapsed().as_secs_f64();
+        *count += 1;
+
+        if secs >= 1.0 {
+            eprintln!("{:.3} msgs/s", *count as f64 / secs);
+            *instant = Instant::now();
+            *count = 0;
+        }
+
+        async move { Some(msg) }
+    });
 
     // Connect to output database
     let mut output_conn = {
@@ -212,37 +279,10 @@ async fn main() -> Result<()> {
     .execute(&mut output_conn)
     .await?;
 
-    // Gather messages from all input databases
-    let message_stream_iter = f_to_p.iter().map(|(path, pool)| {
-        sqlx::query_as::<_, Message>("SELECT * FROM messages")
-            .fetch(pool)
-            .map_ok(move |msg| (path, msg))
-    });
-    let message_stream = stream::select_all(message_stream_iter);
-
-    // Re-index messages
-    let reindexed_message_stream = message_stream
-        .enumerate()
-        .map(|(msg_id, result)| {
-            let (path, msg) = result?;
-            anyhow::Ok((msg_id, path, msg))
-        })
-        .map_ok(|(remap_msg_id, path, msg)| {
-            let key = (path, msg.topic_id);
-            let topic = &f_ti_to_t[&key];
-            let remap_topic_id = tn_to_t[&topic.name].id;
-            Message {
-                id: remap_msg_id as u32,
-                topic_id: remap_topic_id as u32,
-                ..msg
-            }
-        });
-
     // Insert messages into the output database
-    reindexed_message_stream
-        .try_chunks(64)
-        .map_err(|TryChunksError(_chunk, error)| error)
-        .try_fold(output_conn, |mut output_conn, msg_vec| async move {
+    let write_future = message_stream.chunks(8).map(Ok).try_fold(
+        output_conn,
+        |mut output_conn, msg_vec| async move {
             QueryBuilder::new(
                 "INSERT INTO messages (\
                  id, topic_id, timestamp, data\
@@ -259,8 +299,10 @@ async fn main() -> Result<()> {
             .await?;
 
             anyhow::Ok(output_conn)
-        })
-        .await?;
+        },
+    );
+
+    future::try_join(write_future, future::try_join_all(loading_futures)).await?;
 
     Ok(())
 }
