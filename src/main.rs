@@ -42,8 +42,17 @@ async fn main() -> Result<()> {
 
     let n_workers = thread::available_parallelism()?.get();
 
+    /* These mnemonics are used. */
+    // f: file
+    // p: pool
+    // t: topic
+    // tv: topic vec
+    // ti: topic id
+    // tn: topic name
+    // x_to_y: a map from x to y
+
     // Open input sqlite databases
-    let files_to_pools: HashMap<String, Pool<_>> = stream::iter(opts.input_bags)
+    let f_to_p: HashMap<String, Pool<_>> = stream::iter(opts.input_bags)
         .map(|path| async move {
             let uri = format!("sqlite://{}", path);
             let pool = SqlitePoolOptions::new().connect(&uri).await?;
@@ -54,7 +63,7 @@ async fn main() -> Result<()> {
         .await?;
 
     // Read topics from input databases
-    let files_to_topic_vecs: HashMap<&String, Vec<Topic>> = stream::iter(&files_to_pools)
+    let f_to_tv: HashMap<&String, Vec<Topic>> = stream::iter(&f_to_p)
         .map(|(path, pool)| async move {
             let topics: Vec<Topic> = sqlx::query_as("SELECT * FROM topics")
                 .fetch_all(pool)
@@ -67,7 +76,7 @@ async fn main() -> Result<()> {
 
     // Gather topics from input databases, and
     // build a (path, local_topic_id) -> topic map
-    let path_topic_id_pairs_to_topics: HashMap<(&String, u32), &Topic> = files_to_topic_vecs
+    let f_ti_to_t: HashMap<(&String, u32), &Topic> = f_to_tv
         .iter()
         .flat_map(|(path, topic_vec)| topic_vec.iter().map(move |topic| (path, topic)))
         .map(|(&path, topic)| {
@@ -78,17 +87,16 @@ async fn main() -> Result<()> {
         .collect();
 
     // Build a (unique_topic_name, topic) map
-    let unique_topic_name_to_orig_topic: Vec<(&String, &Topic)> = {
+    let tn_to_t: Vec<(&String, &Topic)> = {
         // Group topics by topic names
-        let topic_name_to_topic_group: HashMap<&String, Vec<(&String, &Topic)>> =
-            path_topic_id_pairs_to_topics
-                .iter()
-                .map(|((path, _topic_id), topic)| (&topic.name, (*path, *topic)))
-                .into_group_map();
+        let tn_to_f_t_group: HashMap<&String, Vec<(&String, &Topic)>> = f_ti_to_t
+            .iter()
+            .map(|((path, _topic_id), topic)| (&topic.name, (*path, *topic)))
+            .into_group_map();
 
         // Check that all topics of the same topic name have identical
         // types, serialization formats and QoS profiles.
-        let mut unique_topics: Vec<(&String, &Topic)> = topic_name_to_topic_group
+        let mut tn_to_t: Vec<(&String, &Topic)> = tn_to_f_t_group
             .into_iter()
             .map(|(topic_name, topic_vec)| {
                 let (first_path, first_topic) = &topic_vec[0];
@@ -122,23 +130,31 @@ async fn main() -> Result<()> {
             .try_collect()?;
 
         // Sort topics by topic names
-        unique_topics.sort_by_cached_key(|(topic_name, _)| topic_name.to_string());
-        unique_topics
+        tn_to_t.sort_by_cached_key(|(topic_name, _)| topic_name.to_string());
+        tn_to_t
     };
 
     // Re-index topics
-    let unique_topic_name_to_reindexed_topic: HashMap<&String, Topic> =
-        unique_topic_name_to_orig_topic
-            .into_iter()
-            .enumerate()
-            .map(|(remap_topic_id, (topic_name, topic))| {
-                let remap_topic = Topic {
-                    id: remap_topic_id as u32,
-                    ..topic.clone()
-                };
-                (topic_name, remap_topic)
-            })
-            .collect();
+    let tn_to_t: HashMap<&String, Topic> = tn_to_t
+        .into_iter()
+        .enumerate()
+        .map(|(remap_topic_id, (topic_name, topic))| {
+            let remap_topic = Topic {
+                id: remap_topic_id as u32,
+                ..topic.clone()
+            };
+            (topic_name, remap_topic)
+        })
+        .collect();
+
+    // let f_ti_to_new_ti: HashMap<(String, u32), u32> = f_ti_to_t
+    //     .iter()
+    //     .map(|((path, orig_topic_id), topic)| {
+    //         let topic_name = &topic.name;
+    //         let remap_topic_id = tn_to_t[topic_name].id;
+    //         ((path.to_string(), *orig_topic_id), remap_topic_id)
+    //     })
+    //     .collect();
 
     // Connect to output database
     let mut output_conn = {
@@ -185,22 +201,19 @@ async fn main() -> Result<()> {
          id, name, type, serialization_format, offered_qos_profiles\
          ) ",
     )
-    .push_values(
-        unique_topic_name_to_reindexed_topic.values(),
-        |mut batch, topic| {
-            batch.push_bind(topic.id);
-            batch.push_bind(&topic.name);
-            batch.push_bind(&topic.r#type);
-            batch.push_bind(&topic.serialization_format);
-            batch.push_bind(&topic.offered_qos_profiles);
-        },
-    )
+    .push_values(tn_to_t.values(), |mut batch, topic| {
+        batch.push_bind(topic.id);
+        batch.push_bind(&topic.name);
+        batch.push_bind(&topic.r#type);
+        batch.push_bind(&topic.serialization_format);
+        batch.push_bind(&topic.offered_qos_profiles);
+    })
     .build()
     .execute(&mut output_conn)
     .await?;
 
     // Gather messages from all input databases
-    let message_stream_iter = files_to_pools.iter().map(|(path, pool)| {
+    let message_stream_iter = f_to_p.iter().map(|(path, pool)| {
         sqlx::query_as::<_, Message>("SELECT * FROM messages")
             .fetch(pool)
             .map_ok(move |msg| (path, msg))
@@ -216,8 +229,8 @@ async fn main() -> Result<()> {
         })
         .map_ok(|(remap_msg_id, path, msg)| {
             let key = (path, msg.topic_id);
-            let topic = &path_topic_id_pairs_to_topics[&key];
-            let remap_topic_id = unique_topic_name_to_reindexed_topic[&topic.name].id;
+            let topic = &f_ti_to_t[&key];
+            let remap_topic_id = tn_to_t[&topic.name].id;
             Message {
                 id: remap_msg_id as u32,
                 topic_id: remap_topic_id as u32,
